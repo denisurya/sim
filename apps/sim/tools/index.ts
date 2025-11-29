@@ -193,6 +193,9 @@ export async function executeTool(
 
         const data = await response.json()
         contextParams.accessToken = data.accessToken
+        if (data.idToken) {
+          contextParams.idToken = data.idToken
+        }
 
         logger.info(
           `[${requestId}] Successfully got access token for ${toolId}, length: ${data.accessToken?.length || 0}`
@@ -409,6 +412,38 @@ function isErrorResponse(
 }
 
 /**
+ * Add internal authentication token to headers if running on server
+ * @param headers - Headers object to modify
+ * @param isInternalRoute - Whether the target URL is an internal route
+ * @param requestId - Request ID for logging
+ * @param context - Context string for logging (e.g., toolId or 'proxy')
+ */
+async function addInternalAuthIfNeeded(
+  headers: Headers | Record<string, string>,
+  isInternalRoute: boolean,
+  requestId: string,
+  context: string
+): Promise<void> {
+  if (typeof window === 'undefined') {
+    if (isInternalRoute) {
+      try {
+        const internalToken = await generateInternalToken()
+        if (headers instanceof Headers) {
+          headers.set('Authorization', `Bearer ${internalToken}`)
+        } else {
+          headers.Authorization = `Bearer ${internalToken}`
+        }
+        logger.info(`[${requestId}] Added internal auth token for ${context}`)
+      } catch (error) {
+        logger.error(`[${requestId}] Failed to generate internal token for ${context}:`, error)
+      }
+    } else {
+      logger.info(`[${requestId}] Skipping internal auth token for external URL: ${context}`)
+    }
+  }
+}
+
+/**
  * Handle an internal/direct tool request
  */
 async function handleInternalRequest(
@@ -418,18 +453,25 @@ async function handleInternalRequest(
 ): Promise<ToolResponse> {
   const requestId = generateRequestId()
 
-  // Format the request parameters
   const requestParams = formatRequestParams(tool, params)
 
   try {
     const baseUrl = getBaseUrl()
-    // Handle the case where url may be a function or string
     const endpointUrl =
       typeof tool.request.url === 'function' ? tool.request.url(params) : tool.request.url
 
-    const fullUrl = new URL(endpointUrl, baseUrl).toString()
+    const fullUrlObj = new URL(endpointUrl, baseUrl)
+    const isInternalRoute = endpointUrl.startsWith('/api/')
 
-    // For custom tools, validate parameters on the client side before sending
+    if (isInternalRoute) {
+      const workflowId = params._context?.workflowId
+      if (workflowId) {
+        fullUrlObj.searchParams.set('workflowId', workflowId)
+      }
+    }
+
+    const fullUrl = fullUrlObj.toString()
+
     if (toolId.startsWith('custom_') && tool.request.body) {
       const requestBody = tool.request.body(params)
       if (requestBody.schema && requestBody.params) {
@@ -445,38 +487,48 @@ async function handleInternalRequest(
       }
     }
 
+    const headers = new Headers(requestParams.headers)
+    await addInternalAuthIfNeeded(headers, isInternalRoute, requestId, toolId)
+
     // Prepare request options
     const requestOptions = {
       method: requestParams.method,
-      headers: new Headers(requestParams.headers),
+      headers: headers,
       body: requestParams.body,
     }
 
     const response = await fetch(fullUrl, requestOptions)
 
-    // For non-OK responses, attempt JSON first; if parsing fails, preserve legacy error expected by tests
+    // For non-OK responses, attempt JSON first; if parsing fails, fall back to text
     if (!response.ok) {
       let errorData: any
       try {
         errorData = await response.json()
       } catch (jsonError) {
-        logger.error(`[${requestId}] JSON parse error for ${toolId}:`, {
-          error: jsonError instanceof Error ? jsonError.message : String(jsonError),
-        })
-        throw new Error(`Failed to parse response from ${toolId}: ${jsonError}`)
+        // JSON parsing failed, fall back to reading as text for error extraction
+        logger.warn(`[${requestId}] Response is not JSON for ${toolId}, reading as text`)
+        try {
+          errorData = await response.text()
+        } catch (textError) {
+          logger.error(`[${requestId}] Failed to read response body for ${toolId}`)
+          errorData = null
+        }
       }
 
-      const { isError, errorInfo } = isErrorResponse(response, errorData)
-      if (isError) {
-        const errorToTransform = createTransformedErrorFromErrorInfo(errorInfo, tool.errorExtractor)
-
-        logger.error(`[${requestId}] Internal API error for ${toolId}:`, {
-          status: errorInfo?.status,
-          errorData: errorInfo?.data,
-        })
-
-        throw errorToTransform
+      const errorInfo: ErrorInfo = {
+        status: response.status,
+        statusText: response.statusText,
+        data: errorData,
       }
+
+      const errorToTransform = createTransformedErrorFromErrorInfo(errorInfo, tool.errorExtractor)
+
+      logger.error(`[${requestId}] Internal API error for ${toolId}:`, {
+        status: errorInfo.status,
+        errorData: errorInfo.data,
+      })
+
+      throw errorToTransform
     }
 
     // Parse response data once with guard for empty 202 bodies
@@ -635,9 +687,12 @@ async function handleProxyRequest(
   const proxyUrl = new URL('/api/proxy', baseUrl).toString()
 
   try {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    await addInternalAuthIfNeeded(headers, true, requestId, `proxy:${toolId}`)
+
     const response = await fetch(proxyUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({ toolId, params, executionContext }),
     })
 
@@ -652,9 +707,7 @@ async function handleProxyRequest(
       let errorMessage = `HTTP error ${response.status}: ${response.statusText}`
 
       try {
-        // Try to parse as JSON for more details
         const errorJson = JSON.parse(errorText)
-        // Enhanced error extraction to match internal API patterns
         errorMessage =
           // Primary error patterns
           errorJson.errors?.[0]?.message ||
